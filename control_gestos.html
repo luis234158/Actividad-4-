@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<title>Control de Iluminación por Gestos - ESP32</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; text-align:center; margin:0; padding:20px; }
+  h1 { font-size: 1.3rem; }
+  #contenedor { position: relative; display:inline-block; }
+  video, canvas { width: 480px; height: 360px; border-radius: 12px; }
+  canvas { position:absolute; left:0; top:0; }
+  #gesto-actual { font-size: 1.5rem; margin-top: 14px; font-weight:bold; }
+  #ip-config { margin: 14px 0; }
+  input { padding:6px 10px; border-radius:6px; border:1px solid #555; background:#222; color:#eee; }
+  button { padding:6px 14px; border-radius:6px; border:none; background:#3b82f6; color:white; cursor:pointer; margin-left:6px; }
+  #estado { font-size:0.9rem; color:#9ca3af; margin-top:6px; }
+  .leyenda { margin-top:18px; font-size:0.85rem; color:#9ca3af; text-align:left; display:inline-block; }
+</style>
+</head>
+<body>
+  <h1>Control de Iluminación por Gestos (ESP32 + MediaPipe)</h1>
+
+  <div id="ip-config">
+    IP del ESP32:
+    <input id="ip-esp32" value="192.168.4.1" />
+    <button onclick="guardarIp()">Guardar</button>
+  </div>
+
+  <div id="contenedor">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="gesto-actual">Esperando gesto...</div>
+  <div id="estado">—</div>
+
+  <div class="leyenda">
+    <p><b>Puño cerrado</b> → 30% intensidad</p>
+    <p><b>Señal de paz (Victory)</b> → 70% intensidad</p>
+    <p><b>Palma abierta</b> → 100% intensidad</p>
+    <p><b>Pulgar abajo</b> → Modo 1 (secuencia de barrido)</p>
+    <p><b>Pulgar arriba</b> → Modo 2 (secuencia de parpadeo)</p>
+  </div>
+
+  <!-- Librería MediaPipe Tasks Vision (Gesture Recognizer) -->
+  <script type="module">
+    import {
+      GestureRecognizer,
+      FilesetResolver,
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    const gestoDiv = document.getElementById("gesto-actual");
+    const estadoDiv = document.getElementById("estado");
+
+    let ipESP32 = localStorage.getItem("ip_esp32") || "192.168.4.1";
+    document.getElementById("ip-esp32").value = ipESP32;
+
+    window.guardarIp = function () {
+      ipESP32 = document.getElementById("ip-esp32").value.trim();
+      localStorage.setItem("ip_esp32", ipESP32);
+      estadoDiv.textContent = "IP guardada: " + ipESP32;
+    };
+
+    // Mapeo de la categoría que devuelve MediaPipe -> parámetro para el ESP32
+    const MAPA_GESTOS = {
+      Closed_Fist: "puno",
+      Victory: "paz",
+      Open_Palm: "palma",
+      Thumb_Down: "pulgar_abajo",
+      Thumb_Up: "pulgar_arriba",
+    };
+
+    let ultimoGestoEnviado = null;
+    let ultimoEnvioTs = 0;
+    const COOLDOWN_MS = 1200; // evita saturar al ESP32 con peticiones repetidas
+
+    async function enviarGesto(tipo) {
+      try {
+        estadoDiv.textContent = "Enviando: " + tipo + "...";
+        const resp = await fetch(
+          `http://${ipESP32}/gesto?tipo=${tipo}`,
+          { method: "GET", mode: "cors" }
+        );
+        const texto = await resp.text();
+        estadoDiv.textContent = "ESP32 respondió: " + texto;
+      } catch (err) {
+        estadoDiv.textContent = "Error al conectar con el ESP32 (" + err.message + ")";
+      }
+    }
+
+    async function iniciar() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const gestureRecognizer = await GestureRecognizer.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+        },
+        runningMode: "VIDEO",
+        numHands: 1,
+      });
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      await new Promise((r) => (video.onloadedmetadata = r));
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      function loop() {
+        const ahora = performance.now();
+        const resultado = gestureRecognizer.recognizeForVideo(video, ahora);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (resultado.gestures.length > 0) {
+          const categoria = resultado.gestures[0][0].categoryName;
+          const confianza = resultado.gestures[0][0].score;
+          gestoDiv.textContent = `Gesto: ${categoria} (${(confianza * 100).toFixed(0)}%)`;
+
+          const paramESP32 = MAPA_GESTOS[categoria];
+          if (paramESP32 && confianza > 0.6) {
+            const yaPasoCooldown = ahora - ultimoEnvioTs > COOLDOWN_MS;
+            if (paramESP32 !== ultimoGestoEnviado || yaPasoCooldown) {
+              enviarGesto(paramESP32);
+              ultimoGestoEnviado = paramESP32;
+              ultimoEnvioTs = ahora;
+            }
+          }
+        } else {
+          gestoDiv.textContent = "Esperando gesto...";
+        }
+
+        requestAnimationFrame(loop);
+      }
+      loop();
+    }
+
+    iniciar().catch((err) => {
+      estadoDiv.textContent = "Error iniciando cámara/modelo: " + err.message;
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
